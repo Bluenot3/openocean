@@ -1,0 +1,372 @@
+<html><head><base href="https://websim.ai/procedural-terrain" />
+<title>Ocean Waves Terrain with Wooden Raft and Sail</title>
+<meta name="description" content="Experience an endless, dynamically generated 3D ocean terrain using Three.js and simplex noise, with optimized chunk rendering, multi-layered simplex noise for detailed waves, and a simple wooden raft with a sail and third-person camera controls.">
+<style>
+  body { margin: 0; overflow: hidden; }
+  canvas { width: 100%; height: 100%; }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/simplex-noise/2.4.0/simplex-noise.min.js"></script>
+</head>
+<body>
+<script type="module">
+class TerrainGenerator {
+  constructor() {
+    this.simplex = new SimplexNoise();
+    this.chunkSize = 16;
+    this.heightScale = 10;
+    this.timeOffset = 0;
+    this.animationSpeed = 0.001;
+  }
+
+  getHeightAt(x, z, t, lod) {
+    const worldX = x / 400, worldZ = z / 400;
+    let height = this.simplex.noise3D(worldX, worldZ, t) * this.heightScale;
+    
+    if (lod <= 1) {
+      height += this.simplex.noise3D(x / 50, z / 50, t * 2) * this.heightScale * 0.2;
+      height += this.simplex.noise3D(x / 25, z / 25, t * 4) * this.heightScale * 0.1;
+      if (lod === 0) {
+        height += this.simplex.noise3D(x / 10, z / 10, t * 8) * this.heightScale * 0.05;
+      }
+    }
+    
+    return height;
+  }
+
+  getNormalAt(x, z, t) {
+    const epsilon = 0.1;
+    const height = this.getHeightAt(x, z, t, 0);
+    const heightDx = this.getHeightAt(x + epsilon, z, t, 0);
+    const heightDz = this.getHeightAt(x, z + epsilon, t, 0);
+    return new THREE.Vector3(height - heightDx, epsilon, height - heightDz).normalize();
+  }
+
+  updateTime() {
+    this.timeOffset += this.animationSpeed;
+  }
+}
+
+class ChunkManager {
+  constructor(scene, terrainGenerator) {
+    this.scene = scene;
+    this.terrainGenerator = terrainGenerator;
+    this.chunks = new Map();
+    this.oceanMaterial = new THREE.MeshBasicMaterial({ color: 0x0077be, wireframe: true });
+  }
+
+  createChunk(chunkX, chunkZ, lod) {
+    const geometry = new THREE.BufferGeometry();
+    const vertices = [], indices = [];
+    const step = Math.pow(2, lod);
+    const resolution = this.terrainGenerator.chunkSize / step;
+
+    for (let x = 0; x <= resolution; x++) {
+      for (let z = 0; z <= resolution; z++) {
+        const worldX = (chunkX * this.terrainGenerator.chunkSize) + (x * step);
+        const worldZ = (chunkZ * this.terrainGenerator.chunkSize) + (z * step);
+        const height = this.terrainGenerator.getHeightAt(worldX, worldZ, this.terrainGenerator.timeOffset, lod);
+        vertices.push(x * step, height, z * step);
+      }
+    }
+
+    for (let x = 0; x < resolution; x++) {
+      for (let z = 0; z < resolution; z++) {
+        const topLeft = x * (resolution + 1) + z;
+        const bottomLeft = (x + 1) * (resolution + 1) + z;
+        indices.push(topLeft, bottomLeft, topLeft + 1, bottomLeft, bottomLeft + 1, topLeft + 1);
+      }
+    }
+
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+    geometry.setIndex(indices);
+    geometry.computeVertexNormals();
+
+    const mesh = new THREE.Mesh(geometry, this.oceanMaterial);
+    mesh.position.set(chunkX * this.terrainGenerator.chunkSize, 0, chunkZ * this.terrainGenerator.chunkSize);
+    this.scene.add(mesh);
+    return mesh;
+  }
+
+  updateChunks(playerPosition) {
+    const playerChunkX = Math.floor(playerPosition.x / this.terrainGenerator.chunkSize);
+    const playerChunkZ = Math.floor(playerPosition.z / this.terrainGenerator.chunkSize);
+    const renderDistance = 32;
+
+    for (let x = -renderDistance; x <= renderDistance; x++) {
+      for (let z = -renderDistance; z <= renderDistance; z++) {
+        const chunkX = playerChunkX + x, chunkZ = playerChunkZ + z;
+        const key = `${chunkX},${chunkZ}`;
+        const chunkCenter = new THREE.Vector3(
+          (chunkX + 0.5) * this.terrainGenerator.chunkSize,
+          this.terrainGenerator.getHeightAt((chunkX + 0.5) * this.terrainGenerator.chunkSize, (chunkZ + 0.5) * this.terrainGenerator.chunkSize, this.terrainGenerator.timeOffset, 0),
+          (chunkZ + 0.5) * this.terrainGenerator.chunkSize
+        );
+        const distanceToPlayer = playerPosition.distanceTo(chunkCenter);
+        const lod = Math.min(Math.floor(distanceToPlayer / (this.terrainGenerator.chunkSize * 2)), 4);
+
+        if (distanceToPlayer < this.terrainGenerator.chunkSize * renderDistance) {
+          if (!this.chunks.has(key) || this.chunks.get(key).lod !== lod) {
+            if (this.chunks.has(key)) {
+              this.scene.remove(this.chunks.get(key).mesh);
+            }
+            this.chunks.set(key, { mesh: this.createChunk(chunkX, chunkZ, lod), lod: lod });
+          } else {
+            this.updateChunkGeometry(this.chunks.get(key).mesh, chunkX, chunkZ, lod);
+          }
+        } else if (this.chunks.has(key)) {
+          this.scene.remove(this.chunks.get(key).mesh);
+          this.chunks.delete(key);
+        }
+      }
+    }
+  }
+
+  updateChunkGeometry(mesh, chunkX, chunkZ, lod) {
+    const positions = mesh.geometry.attributes.position.array;
+    const step = Math.pow(2, lod);
+    const resolution = this.terrainGenerator.chunkSize / step;
+
+    let index = 0;
+    for (let x = 0; x <= resolution; x++) {
+      for (let z = 0; z <= resolution; z++) {
+        const worldX = (chunkX * this.terrainGenerator.chunkSize) + (x * step);
+        const worldZ = (chunkZ * this.terrainGenerator.chunkSize) + (z * step);
+        positions[index * 3 + 1] = this.terrainGenerator.getHeightAt(worldX, worldZ, this.terrainGenerator.timeOffset, lod);
+        index++;
+      }
+    }
+
+    mesh.geometry.attributes.position.needsUpdate = true;
+    mesh.geometry.computeVertexNormals();
+  }
+}
+
+class Raft {
+  constructor(scene, terrainGenerator) {
+    this.scene = scene;
+    this.terrainGenerator = terrainGenerator;
+    this.moveSpeed = 20;
+    this.turnSpeed = 1;
+    this.velocity = new THREE.Vector3();
+    this.rotation = new THREE.Euler(0, Math.PI / 2, 0, 'YXZ');
+    this.createRaftMesh();
+    this.setupControls();
+  }
+
+  createRaftMesh() {
+    const raftGroup = new THREE.Group();
+    const logGeometry = new THREE.CylinderGeometry(0.25, 0.25, 4, 8);
+    const logMaterial = new THREE.MeshBasicMaterial({ color: 0x8B4513 });
+
+    for (let i = 0; i < 8; i++) {
+      const log = new THREE.Mesh(logGeometry, logMaterial);
+      log.rotation.x = Math.PI / 2;
+      log.position.set(i * 0.5 - 1.75, -0.8, 0);
+      raftGroup.add(log);
+    }
+
+    const uprightLog = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 3, 8), logMaterial);
+    uprightLog.position.set(0, 0.7, 0);
+    raftGroup.add(uprightLog);
+
+    const sailGeometry = new THREE.PlaneGeometry(2, 2.5);
+    const sailMaterial = new THREE.MeshBasicMaterial({ color: 0xFFFFFF, side: THREE.DoubleSide });
+    const sail = new THREE.Mesh(sailGeometry, sailMaterial);
+    sail.position.set(0, 1.5, 0);
+    sail.rotation.y = Math.PI;
+    raftGroup.add(sail);
+
+    this.mesh = raftGroup;
+    this.mesh.position.set(0, 5, 0);
+    this.mesh.rotation.y = Math.PI / 2;
+    this.scene.add(this.mesh);
+  }
+
+  setupControls() {
+    this.moveForward = this.moveBackward = this.turnLeft = this.turnRight = false;
+    document.addEventListener('keydown', (event) => this.onKeyChange(event, true));
+    document.addEventListener('keyup', (event) => this.onKeyChange(event, false));
+  }
+
+  onKeyChange(event, isKeyDown) {
+    switch (event.code) {
+      case 'KeyW': this.moveForward = isKeyDown; break;
+      case 'KeyS': this.moveBackward = isKeyDown; break;
+      case 'KeyA': this.turnLeft = isKeyDown; break;
+      case 'KeyD': this.turnRight = isKeyDown; break;
+    }
+  }
+
+  update(delta) {
+    if (this.turnLeft) this.rotation.y += this.turnSpeed * delta;
+    if (this.turnRight) this.rotation.y -= this.turnSpeed * delta;
+
+    const direction = new THREE.Vector3(0, 0, -1).applyEuler(this.rotation);
+    if (this.moveForward) this.velocity.addScaledVector(direction, this.moveSpeed * delta);
+    if (this.moveBackward) this.velocity.addScaledVector(direction, -this.moveSpeed * delta);
+
+    this.mesh.position.addScaledVector(this.velocity, delta);
+    const terrainHeight = this.terrainGenerator.getHeightAt(this.mesh.position.x, this.mesh.position.z, this.terrainGenerator.timeOffset, 0);
+    this.mesh.position.y = terrainHeight + 1;
+
+    const normal = this.terrainGenerator.getNormalAt(this.mesh.position.x, this.mesh.position.z, this.terrainGenerator.timeOffset);
+    this.mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), normal);
+    this.mesh.rotateY(this.rotation.y);
+
+    this.velocity.multiplyScalar(0.95);
+  }
+}
+
+class ThirdPersonCamera {
+  constructor(camera, target) {
+    this.camera = camera;
+    this.target = target;
+    this.distance = 10;
+    this.phi = Math.PI / 2 - 0.1 - Math.PI / 18;
+    this.theta = Math.PI / 6;
+    this.setupMouseControls();
+  }
+
+  setupMouseControls() {
+    document.addEventListener('mousemove', (event) => {
+      if (document.pointerLockElement === document.body) {
+        this.theta -= event.movementX * 0.002;
+        this.phi = Math.max(0.1, Math.min(Math.PI / 2 - 0.1, this.phi - event.movementY * 0.002));
+      }
+    });
+    document.addEventListener('wheel', (event) => {
+      this.distance = Math.max(5, Math.min(20, this.distance + event.deltaY * 0.05));
+    });
+  }
+
+  update() {
+    const x = this.distance * Math.sin(this.phi) * Math.cos(this.theta);
+    const y = this.distance * Math.cos(this.phi);
+    const z = this.distance * Math.sin(this.phi) * Math.sin(this.theta);
+    this.camera.position.set(
+      this.target.mesh.position.x + x,
+      this.target.mesh.position.y + y,
+      this.target.mesh.position.z + z
+    );
+    this.camera.lookAt(this.target.mesh.position);
+  }
+}
+
+class SkyGradient {
+  constructor(scene) {
+    this.scene = scene;
+    this.sky = this.createSky();
+  }
+
+  createSky() {
+    const vertexShader = `
+      varying vec3 vWorldPosition;
+      void main() {
+        vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+        vWorldPosition = worldPosition.xyz;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `;
+
+    const fragmentShader = `
+      uniform vec3 topColor;
+      uniform vec3 middleColor;
+      uniform vec3 bottomColor;
+      uniform float offset;
+      uniform float exponent;
+      varying vec3 vWorldPosition;
+      void main() {
+        float h = normalize(vWorldPosition + offset).y;
+        vec3 color = h > 0.03 ? mix(middleColor, topColor, max(pow(max(h - 0.03, 0.0), exponent), 0.0)) : bottomColor;
+        gl_FragColor = vec4(color, 1.0);
+      }
+    `;
+
+    const uniforms = {
+      topColor: { value: new THREE.Color(0x0077ff) },
+      middleColor: { value: new THREE.Color(0xffffff) },
+      bottomColor: { value: new THREE.Color(0x001a33) },
+      offset: { value: 33 },
+      exponent: { value: 0.6 }
+    };
+
+    const skyGeo = new THREE.SphereGeometry(1000, 32, 15);
+    const skyMat = new THREE.ShaderMaterial({
+      uniforms: uniforms,
+      vertexShader: vertexShader,
+      fragmentShader: fragmentShader,
+      side: THREE.BackSide
+    });
+
+    const sky = new THREE.Mesh(skyGeo, skyMat);
+    this.scene.add(sky);
+    return sky;
+  }
+
+  update(playerPosition) {
+    this.sky.position.copy(playerPosition);
+  }
+}
+
+class Game {
+  constructor() {
+    this.scene = new THREE.Scene();
+    this.renderer = new THREE.WebGLRenderer();
+    this.renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(this.renderer.domElement);
+
+    this.camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1,
+    2000);
+
+    this.terrainGenerator = new TerrainGenerator();
+    this.chunkManager = new ChunkManager(this.scene, this.terrainGenerator);
+    this.raft = new Raft(this.scene, this.terrainGenerator);
+    this.thirdPersonCamera = new ThirdPersonCamera(this.camera, this.raft);
+    this.skyGradient = new SkyGradient(this.scene);
+
+    this.prevTime = performance.now();
+
+    window.addEventListener('resize', this.onWindowResize.bind(this));
+    document.body.addEventListener('click', () => {
+      document.body.requestPointerLock();
+      if (document.documentElement.requestFullscreen) {
+        document.documentElement.requestFullscreen();
+      } else if (document.documentElement.mozRequestFullScreen) {
+        document.documentElement.mozRequestFullScreen();
+      } else if (document.documentElement.webkitRequestFullscreen) {
+        document.documentElement.webkitRequestFullscreen();
+      } else if (document.documentElement.msRequestFullscreen) {
+        document.documentElement.msRequestFullscreen();
+      }
+    });
+
+    this.animate();
+  }
+
+  onWindowResize() {
+    this.camera.aspect = window.innerWidth / window.innerHeight;
+    this.camera.updateProjectionMatrix();
+    this.renderer.setSize(window.innerWidth, window.innerHeight);
+  }
+
+  animate() {
+    requestAnimationFrame(this.animate.bind(this));
+
+    const time = performance.now();
+    const delta = (time - this.prevTime) / 1000;
+    this.prevTime = time;
+
+    this.terrainGenerator.updateTime();
+    this.raft.update(delta);
+    this.thirdPersonCamera.update();
+    this.chunkManager.updateChunks(this.raft.mesh.position);
+    this.skyGradient.update(this.raft.mesh.position);
+    this.renderer.render(this.scene, this.camera);
+  }
+}
+
+const game = new Game();
+</script>
+</body>
+</html>
